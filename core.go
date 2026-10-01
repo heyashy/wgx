@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type Settings struct {
@@ -41,6 +42,7 @@ var peerRE = regexp.MustCompile(`(?m)^\[Peer\][ \t]*\r?$`)
 func (a Admin) iface() string        { return strings.TrimSuffix(filepath.Base(a.Config), ".conf") }
 func (a Admin) stateDir() string     { return filepath.Join(filepath.Dir(a.Config), "wgx", a.iface()) }
 func (a Admin) settingsPath() string { return filepath.Join(a.stateDir(), "settings.json") }
+func (a Admin) clientsPath() string  { return filepath.Join(a.stateDir(), "clients.json") }
 func (a Admin) profilePath(name string) string {
 	return filepath.Join(a.stateDir(), "peers", name+".conf")
 }
@@ -269,6 +271,7 @@ func (a Admin) init(address string, port int, s Settings) error {
 		os.Remove(a.Config)
 		return err
 	}
+	a.recordEvent("server", "Created "+a.iface())
 	return nil
 }
 
@@ -285,7 +288,11 @@ func (a Admin) adopt(s Settings) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return a.saveSettings(s)
+	if err := a.saveSettings(s); err != nil {
+		return err
+	}
+	a.recordEvent("server", "Adopted "+a.iface())
+	return nil
 }
 
 func (a Admin) peers() ([]Peer, error) {
@@ -294,7 +301,175 @@ func (a Admin) peers() ([]Peer, error) {
 		return nil, err
 	}
 	_, peers := parseConfig(data)
+	clients := a.loadClients()
+	for i := range peers {
+		if !peers[i].Managed {
+			if name := clients[peers[i].PublicKey].Name; nameRE.MatchString(name) {
+				peers[i].Name = name
+			}
+		}
+	}
 	return peers, nil
+}
+
+type ClientMeta struct {
+	Name     string    `json:"name,omitempty"`
+	Note     string    `json:"note,omitempty"`
+	LastSeen time.Time `json:"last_seen,omitempty"`
+}
+
+func (a Admin) loadClients() map[string]ClientMeta {
+	clients := make(map[string]ClientMeta)
+	b, err := os.ReadFile(a.clientsPath())
+	if err == nil {
+		_ = json.Unmarshal(b, &clients)
+		return clients
+	}
+	// Read state from older development builds if present.
+	var aliases map[string]string
+	if b, err := os.ReadFile(filepath.Join(a.stateDir(), "aliases.json")); err == nil {
+		_ = json.Unmarshal(b, &aliases)
+	}
+	for key, name := range aliases {
+		meta := clients[key]
+		meta.Name = name
+		clients[key] = meta
+	}
+	var seen map[string]time.Time
+	if b, err := os.ReadFile(filepath.Join(a.stateDir(), "last-seen.json")); err == nil {
+		_ = json.Unmarshal(b, &seen)
+	}
+	for key, at := range seen {
+		meta := clients[key]
+		meta.LastSeen = at
+		clients[key] = meta
+	}
+	return clients
+}
+
+func (a Admin) saveClients(clients map[string]ClientMeta) error {
+	if current, err := os.ReadFile(a.clientsPath()); err == nil {
+		var valid map[string]ClientMeta
+		if err := json.Unmarshal(current, &valid); err != nil {
+			return fmt.Errorf("clients metadata is invalid; refusing to overwrite: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	b, err := json.MarshalIndent(clients, "", "  ")
+	if err != nil {
+		return err
+	}
+	return secureWrite(a.clientsPath(), append(b, '\n'))
+}
+
+func (a Admin) renamePeer(oldName, newName string) error {
+	if !nameRE.MatchString(newName) {
+		return errors.New("new name must be 1-32 letters, numbers, underscores or hyphens")
+	}
+	unlock, err := a.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	data, err := a.readConfig()
+	if err != nil {
+		return err
+	}
+	prefix, peers := parseConfig(data)
+	clients := a.loadClients()
+	for i := range peers {
+		if !peers[i].Managed {
+			if name := clients[peers[i].PublicKey].Name; nameRE.MatchString(name) {
+				peers[i].Name = name
+			}
+		}
+	}
+	target := -1
+	for i, p := range peers {
+		if p.Name == newName && oldName != newName {
+			return errors.New("name already in use")
+		}
+		if p.Name == oldName {
+			target = i
+		}
+	}
+	if target < 0 {
+		return errors.New("peer not found")
+	}
+	if oldName == newName {
+		return nil
+	}
+	p := peers[target]
+	if p.Managed {
+		oldPath, newPath := a.profilePath(oldName), a.profilePath(newName)
+		if _, err := os.Stat(newPath); err == nil {
+			return errors.New("destination profile already exists")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		renamed := false
+		if err := os.Rename(oldPath, newPath); err == nil {
+			renamed = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		peers[target].Block = strings.Replace(p.Block, "# wgx:name="+oldName, "# wgx:name="+newName, 1)
+		var out strings.Builder
+		out.WriteString(prefix)
+		for _, peer := range peers {
+			out.WriteString(peer.Block)
+		}
+		if err := secureWrite(a.Config, []byte(out.String())); err != nil {
+			if renamed {
+				_ = os.Rename(newPath, oldPath)
+			}
+			return err
+		}
+	} else {
+		meta := clients[p.PublicKey]
+		meta.Name = newName
+		clients[p.PublicKey] = meta
+		if err := a.saveClients(clients); err != nil {
+			return err
+		}
+	}
+	a.recordEvent("peer", "Renamed "+oldName+" to "+newName)
+	return nil
+}
+
+func (a Admin) setPeerNote(name, note string) error {
+	if len(note) > 160 || strings.ContainsAny(note, "\r\n") {
+		return errors.New("note must be one line, at most 160 characters")
+	}
+	unlock, err := a.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	peers, err := a.peers()
+	if err != nil {
+		return err
+	}
+	var key string
+	for _, p := range peers {
+		if p.Name == name {
+			key = p.PublicKey
+			break
+		}
+	}
+	if key == "" {
+		return errors.New("peer not found")
+	}
+	clients := a.loadClients()
+	meta := clients[key]
+	meta.Note = strings.TrimSpace(note)
+	clients[key] = meta
+	if err := a.saveClients(clients); err != nil {
+		return err
+	}
+	a.recordEvent("peer", "Updated note for "+name)
+	return nil
 }
 
 func nextAddress(data string, peers []Peer) (netip.Addr, error) {
@@ -356,6 +531,14 @@ func (a Admin) addPeer(name string) (string, error) {
 		return "", err
 	}
 	_, peers := parseConfig(data)
+	clients := a.loadClients()
+	for i := range peers {
+		if !peers[i].Managed {
+			if name := clients[peers[i].PublicKey].Name; nameRE.MatchString(name) {
+				peers[i].Name = name
+			}
+		}
+	}
 	for _, p := range peers {
 		if p.Name == name {
 			return "", errors.New("peer already exists")
@@ -404,11 +587,13 @@ func (a Admin) removePeer(name string) error {
 	}
 	prefix, peers := parseConfig(data)
 	found := false
+	removedKey := ""
 	var out strings.Builder
 	out.WriteString(prefix)
 	for _, p := range peers {
 		if p.Name == name && p.Managed {
 			found = true
+			removedKey = p.PublicKey
 			continue
 		}
 		out.WriteString(p.Block)
@@ -422,6 +607,9 @@ func (a Admin) removePeer(name string) error {
 	if err := os.Remove(a.profilePath(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	clients := a.loadClients()
+	delete(clients, removedKey)
+	_ = a.saveClients(clients)
 	return nil
 }
 
@@ -430,8 +618,10 @@ func (a Admin) addAndApply(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	a.recordEvent("peer", "Added "+name)
 	if a.active() {
 		if err := a.apply(); err != nil {
+			a.recordEvent("error", "Live apply failed after adding "+name)
 			return path, fmt.Errorf("peer saved, but live apply failed: %w", err)
 		}
 	}
@@ -442,8 +632,10 @@ func (a Admin) removeAndApply(name string) error {
 	if err := a.removePeer(name); err != nil {
 		return err
 	}
+	a.recordEvent("peer", "Removed "+name)
 	if a.active() {
 		if err := a.apply(); err != nil {
+			a.recordEvent("error", "Live apply failed after removing "+name)
 			return fmt.Errorf("peer removed from file, but live apply failed: %w", err)
 		}
 	}
@@ -490,8 +682,24 @@ func runOutput(name string, args ...string) (string, error) {
 }
 
 func (a Admin) active() bool { return exec.Command("wg", "show", a.iface()).Run() == nil }
-func (a Admin) up() error    { _, err := runOutput("wg-quick", "up", a.Config); return err }
-func (a Admin) down() error  { _, err := runOutput("wg-quick", "down", a.Config); return err }
+func (a Admin) up() error {
+	_, err := runOutput("wg-quick", "up", a.Config)
+	if err == nil {
+		a.recordEvent("server", "Started "+a.iface())
+	} else {
+		a.recordEvent("error", "Failed to start "+a.iface())
+	}
+	return err
+}
+func (a Admin) down() error {
+	_, err := runOutput("wg-quick", "down", a.Config)
+	if err == nil {
+		a.recordEvent("server", "Stopped "+a.iface())
+	} else {
+		a.recordEvent("error", "Failed to stop "+a.iface())
+	}
+	return err
+}
 func (a Admin) apply() error {
 	if !a.active() {
 		return errors.New("interface is down; run wgx up first")
@@ -504,20 +712,37 @@ func (a Admin) apply() error {
 	c.Stdin = strings.NewReader(stripped)
 	b, err := c.CombinedOutput()
 	if err != nil {
+		a.recordEvent("error", "Live apply failed for "+a.iface())
 		return fmt.Errorf("wg syncconf: %w: %s", err, strings.TrimSpace(string(b)))
 	}
+	a.recordEvent("server", "Applied config to "+a.iface())
 	return nil
 }
 
-func (a Admin) status() string {
-	if !a.active() {
-		return "Interface down"
-	}
-	out, err := runOutput("wg", "show", a.iface())
+func (a Admin) status() (string, error) {
+	peers, err := a.peers()
 	if err != nil {
-		return err.Error()
+		return "", err
 	}
-	return strings.TrimSpace(out)
+	telemetry, clients := a.collectTelemetry()
+	state := "DOWN"
+	if telemetry.Up {
+		state = "RUNNING"
+	}
+	var out strings.Builder
+	clientWord := "clients"
+	if len(peers) == 1 {
+		clientWord = "client"
+	}
+	fmt.Fprintf(&out, "%s  %s  %d %s", a.iface(), state, len(peers), clientWord)
+	if telemetry.Up {
+		fmt.Fprintf(&out, "  UDP %d", telemetry.ListenPort)
+	}
+	for _, peer := range peers {
+		live := telemetry.Peers[peer.PublicKey]
+		fmt.Fprintf(&out, "\n%-20s %-18s %-20s ↓ %s  ↑ %s", peer.Name, peer.AllowedIPs, lastSeenLabel(clients[peer.PublicKey].LastSeen, time.Now()), humanBytes(live.Received), humanBytes(live.Sent))
+	}
+	return out.String(), nil
 }
 
 func parsePort(v string) (int, error) {

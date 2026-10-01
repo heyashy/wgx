@@ -1,6 +1,6 @@
 # wgx — WireGuard Exchange
 
-`wgx` is a Go terminal app for administering one WireGuard server interface. It creates or adopts a `wg-quick` config, allocates peer addresses, writes client profiles, and applies saved changes to a running interface. The dashboard supports keyboard and mouse input. CLI subcommands are available for scripts.
+`wgx` is a Go terminal control plane for one WireGuard server interface. It creates or adopts a `wg-quick` config, allocates peer addresses, writes client profiles, and applies saved changes to a running interface. Its keyboard and mouse dashboard brings together client names, last handshakes, traffic, notes, and activity. CLI subcommands remain available for scripts.
 
 ## Build
 
@@ -26,7 +26,6 @@ sudo wgx init --address 10.44.0.1/24 --listen-port 51820 --endpoint vpn.example.
 sudo wgx up
 sudo wgx peer add laptop
 sudo wgx peer list
-sudo wgx peer export laptop --output ./laptop.conf
 sudo wgx
 ```
 
@@ -37,12 +36,15 @@ For an existing server config:
 ```sh
 sudo wgx adopt --endpoint vpn.example.com:51820
 sudo wgx peer add phone
-sudo wgx apply
+sudo wgx peer rename phone alice-phone
+sudo wgx peer note alice-phone 'Alice personal phone'
 ```
 
-`adopt` leaves existing peer blocks untouched. `wgx` peers are marked in the server config and can be removed by name. Existing unmarked peers are shown read-only; their private keys cannot be recovered from a server config. `wgx peer remove phone` removes the saved client profile. Peer additions and removals update the live interface automatically when it is running.
+`adopt` leaves existing peer blocks untouched. `wgx` peers are marked in the server config and can be removed by name. Existing unmarked peers can be given a display name and note, while their network settings remain untouched; their private keys cannot be recovered from a server config. `wgx peer remove alice-phone` removes a managed peer and its saved client profile. Peer additions and removals update the live interface automatically when it is running.
 
-Use `wgx --config /path/to/wg1.conf` before any command to select a different interface. `wgx help` shows all commands. Run `wgx` without a command for the app. The dashboard supports arrow keys or `j`/`k`, mouse row selection and wheel scrolling. Use `n` to add, `d` to delete, `e` to open onboarding details, `a` to apply, `u` to bring up, `x` to bring down, `r` to refresh, and `q` to quit. Onboarding uses `1` for details, `2` for QR, `v` to reveal the full config, and `b` to return. The QR needs enough terminal space to display in full.
+Use `wgx --config /path/to/wg1.conf` before any command to select a different interface. `wgx help` shows all commands. Run `wgx` without a command for the app. The dashboard supports arrow keys or `j`/`k`, mouse row selection and wheel scrolling. Use `n` to add, `m` to rename, `p` to edit a note, `d` to delete, `e` to open onboarding details, `l` for logs, `a` to apply, `u` to bring up, `x` to bring down, `r` to refresh, and `q` to quit. Logs use `1` for wgx activity and `2` for the `wg-quick@INTERFACE` system journal. Onboarding uses `1` for details, `2` for QR, `v` to reveal the full config, and `b` to return. The QR needs enough terminal space to display in full.
+
+The app refreshes every five seconds. “Last seen” is the latest observed WireGuard handshake, retained across interface restarts in `/etc/wireguard/wgx/INTERFACE/clients.json`. A recent handshake does not guarantee that a device is currently connected. This local metadata file also stores names and notes, keyed by public key. Admin actions and new handshake observations are saved in `activity.jsonl` in the same directory. The system journal tab is available when `journalctl` and the `wg-quick` service journal exist; the Docker lab still has the local activity log.
 
 For secure handoff from a remote VM, stream the client profile or QR image over SSH to a private local file:
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -42,9 +43,25 @@ type dashboard struct {
 	shareQR       string
 	shareTab      string
 	secretVisible bool
+	telemetry     Telemetry
+	clients       map[string]ClientMeta
+	events        []Event
+	journal       []string
+	journalErr    string
+	logSource     string
+	logOffset     int
+	hits          []hitbox
 }
 
-func (m *dashboard) Init() tea.Cmd { return nil }
+type pulseMsg struct{}
+type hitbox struct {
+	x0, x1, y int
+	action    string
+	index     int
+}
+
+func pulse() tea.Cmd               { return tea.Tick(5*time.Second, func(time.Time) tea.Msg { return pulseMsg{} }) }
+func (m *dashboard) Init() tea.Cmd { return pulse() }
 
 func (m *dashboard) refresh() {
 	peers, err := m.a.peers()
@@ -54,6 +71,16 @@ func (m *dashboard) refresh() {
 		return
 	}
 	m.peers = peers
+	m.telemetry, m.clients = m.a.collectTelemetry()
+	m.events = m.a.recentEvents(100)
+	if m.logSource == "system" {
+		m.journal, err = m.a.systemJournal(100)
+		if err != nil {
+			m.journalErr = err.Error()
+		} else {
+			m.journalErr = ""
+		}
+	}
 	if m.selected >= len(peers) {
 		m.selected = len(peers) - 1
 	}
@@ -63,9 +90,9 @@ func (m *dashboard) refresh() {
 }
 
 func (m *dashboard) visibleRows() int {
-	n := m.height - 16
-	if n < 3 {
-		n = 3
+	n := m.height - 19
+	if n < 1 {
+		n = 1
 	}
 	return n
 }
@@ -107,6 +134,20 @@ func (m *dashboard) action(key string) {
 		}
 		m.mode = "delete"
 		return
+	case "m", "p":
+		if m.selected < 0 || m.selected >= len(m.peers) {
+			m.message = "Select a client first"
+			return
+		}
+		p := m.peers[m.selected]
+		if key == "m" {
+			m.mode = "rename"
+			m.input = p.Name
+		} else {
+			m.mode = "note"
+			m.input = m.clients[p.PublicKey].Note
+		}
+		return
 	case "e":
 		if m.selected < 0 || m.selected >= len(m.peers) {
 			m.message = "Select a peer first"
@@ -129,18 +170,40 @@ func (m *dashboard) action(key string) {
 		} else {
 			m.message = "Live interface updated"
 		}
+		m.refresh()
 	case "u":
 		if err := m.a.up(); err != nil {
 			m.message = err.Error()
 		} else {
 			m.message = "Interface started"
 		}
+		m.refresh()
 	case "x":
 		if err := m.a.down(); err != nil {
 			m.message = err.Error()
 		} else {
 			m.message = "Interface stopped"
 		}
+		m.refresh()
+	case "l":
+		m.mode = "logs"
+		m.logOffset = 0
+		m.refresh()
+	}
+}
+
+func (m *dashboard) logAction(action string) {
+	switch action {
+	case "activity":
+		m.logSource = "activity"
+		m.logOffset = 0
+		m.refresh()
+	case "system":
+		m.logSource = "system"
+		m.logOffset = 0
+		m.refresh()
+	case "back":
+		m.mode = ""
 	}
 }
 
@@ -224,7 +287,29 @@ func (m *dashboard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+	case pulseMsg:
+		if m.mode != "setup" {
+			m.refresh()
+		}
+		return m, pulse()
 	case tea.MouseMsg:
+		if m.mode == "logs" {
+			if msg.Type == tea.MouseWheelUp {
+				m.logOffset++
+			}
+			if msg.Type == tea.MouseWheelDown && m.logOffset > 0 {
+				m.logOffset--
+			}
+			if msg.Type == tea.MouseLeft {
+				for _, h := range m.hits {
+					if h.y == msg.Y && msg.X >= h.x0 && msg.X < h.x1 {
+						m.logAction(h.action)
+						break
+					}
+				}
+			}
+			return m, nil
+		}
 		if msg.Type == tea.MouseLeft && m.mode == "share" && msg.Y == m.actionY {
 			if msg.X >= 2 && msg.X < 13 {
 				m.shareTab = "details"
@@ -251,30 +336,25 @@ func (m *dashboard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.move(1)
 		}
 		if msg.Type == tea.MouseLeft {
-			if msg.Y >= m.rowY && msg.Y < m.rowY+m.visibleRows() {
-				idx := m.scroll + msg.Y - m.rowY
-				if idx < len(m.peers) {
-					m.selected = idx
-				}
-			}
-			if msg.Y == m.actionY || msg.Y == m.actionY2 {
-				buttons := []struct {
-					y, start, end int
-					key           string
-				}{{m.actionY, 2, 9, "n"}, {m.actionY, 11, 21, "d"}, {m.actionY, 23, 33, "e"}, {m.actionY, 35, 44, "a"}, {m.actionY2, 2, 8, "u"}, {m.actionY2, 10, 18, "x"}, {m.actionY2, 20, 31, "r"}}
-				for _, b := range buttons {
-					if msg.Y == b.y && msg.X >= b.start && msg.X < b.end {
-						m.action(b.key)
+			for _, h := range m.hits {
+				if h.y == msg.Y && msg.X >= h.x0 && msg.X < h.x1 {
+					if h.action == "select" {
+						m.selected = h.index
+					} else if h.action == "q" {
+						return m, tea.Quit
+					} else {
+						m.action(h.action)
 					}
+					break
 				}
 			}
 		}
 	case tea.KeyMsg:
-		if msg.Paste && (m.mode == "setup" || m.mode == "add") {
+		if msg.Paste && (m.mode == "setup" || m.mode == "add" || m.mode == "rename" || m.mode == "note") {
 			content := strings.TrimSpace(string(msg.Runes))
 			if !strings.ContainsAny(content, "\r\n") {
 				limit := 128
-				if m.mode == "add" {
+				if m.mode == "add" || m.mode == "rename" {
 					limit = 32
 				}
 				if len(m.input)+len(content) <= limit {
@@ -326,6 +406,27 @@ func (m *dashboard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.mode == "logs" {
+			switch key {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc", "b", "q":
+				m.mode = ""
+			case "1":
+				m.logAction("activity")
+			case "2":
+				m.logAction("system")
+			case "r":
+				m.refresh()
+			case "up", "k":
+				m.logOffset++
+			case "down", "j":
+				if m.logOffset > 0 {
+					m.logOffset--
+				}
+			}
+			return m, nil
+		}
 		if m.mode == "add" {
 			switch key {
 			case "esc":
@@ -372,6 +473,43 @@ func (m *dashboard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.mode == "rename" || m.mode == "note" {
+			switch key {
+			case "esc":
+				m.mode = ""
+				m.input = ""
+			case "enter":
+				name := m.peers[m.selected].Name
+				var err error
+				if m.mode == "rename" {
+					err = m.a.renamePeer(name, m.input)
+				} else {
+					err = m.a.setPeerNote(name, m.input)
+				}
+				if err != nil {
+					m.message = err.Error()
+				} else {
+					m.mode = ""
+					m.message = "Client details updated"
+					m.refresh()
+				}
+			case "backspace":
+				if len(m.input) > 0 {
+					_, size := utf8.DecodeLastRuneInString(m.input)
+					m.input = m.input[:len(m.input)-size]
+				}
+			default:
+				chars := string(msg.Runes)
+				limit := 160
+				if m.mode == "rename" {
+					limit = 32
+				}
+				if chars != "" && !strings.ContainsAny(chars, "\r\n") && len(m.input)+len(chars) <= limit {
+					m.input += chars
+				}
+			}
+			return m, nil
+		}
 		switch key {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -379,7 +517,7 @@ func (m *dashboard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.move(-1)
 		case "down", "j":
 			m.move(1)
-		case "n", "d", "e", "r", "a", "u", "x":
+		case "n", "d", "e", "m", "p", "l", "r", "a", "u", "x":
 			m.action(key)
 		}
 	}
@@ -393,67 +531,13 @@ func (m *dashboard) View() string {
 	if m.mode == "share" {
 		return m.shareView()
 	}
-	w := m.width
-	if w < 48 {
-		w = 48
+	if m.mode == "logs" {
+		return m.logsView()
 	}
-	line := strings.Repeat("─", min(w-4, 92))
-	state := warn.Render("● down")
-	if m.a.active() {
-		state = brand.Render("● active")
+	if m.mode == "add" || m.mode == "rename" || m.mode == "note" || m.mode == "delete" {
+		return m.modalView()
 	}
-	lines := []string{
-		"  " + brand.Render("WGX") + "  " + muted.Render("/ WireGuard Exchange") + "                               " + state,
-		"  " + muted.Render(line),
-		"  " + bright.Render(m.a.iface()) + "  " + muted.Render(m.a.Config),
-		"  " + accent.Render(fmt.Sprintf("%d peers", len(m.peers))) + "  " + muted.Render("↑↓ navigate  •  mouse click / wheel  •  q quit"),
-		"",
-		"  " + muted.Render(fmt.Sprintf("%-22s %-22s %-15s", "PEER", "TUNNEL ADDRESS", "SOURCE")),
-	}
-	m.rowY = len(lines)
-	visible := m.visibleRows()
-	for i := 0; i < visible; i++ {
-		idx := m.scroll + i
-		if idx < len(m.peers) {
-			p := m.peers[idx]
-			kind := "existing"
-			if p.Managed {
-				kind = "wgx"
-			}
-			label := fmt.Sprintf("  %-22.22s %-22.22s %-15s", p.Name, p.AllowedIPs, kind)
-			if idx == m.selected {
-				lines = append(lines, rowSelected.Render(label))
-			} else {
-				lines = append(lines, bright.Render(label))
-			}
-		} else if i == 0 && len(m.peers) == 0 {
-			lines = append(lines, muted.Render("  No peers yet. Press n to add one."))
-		} else {
-			lines = append(lines, "")
-		}
-	}
-	lines = append(lines, "  "+muted.Render(line))
-	if m.selected >= 0 && m.selected < len(m.peers) {
-		p := m.peers[m.selected]
-		lines = append(lines, "  "+accent.Render(p.Name)+"  "+muted.Render(shortKey(p.PublicKey)+"…"))
-	} else {
-		lines = append(lines, "  "+muted.Render("Select a peer to inspect it"))
-	}
-	lines = append(lines, "")
-	m.actionY = len(lines)
-	lines = append(lines, "  "+brand.Render("[n] New")+"  "+bright.Render("[d] Delete")+"  "+bright.Render("[e] Export")+"  "+bright.Render("[a] Apply"))
-	m.actionY2 = len(lines)
-	lines = append(lines, "  "+bright.Render("[u] Up")+"  "+bright.Render("[x] Down")+"  "+bright.Render("[r] Refresh"))
-	if m.mode == "add" {
-		lines = append(lines, "  "+accent.Render("New peer name: ")+m.input+"█  "+muted.Render("enter save · esc cancel"))
-	}
-	if m.mode == "delete" {
-		lines = append(lines, "  "+warn.Render("Delete selected peer and its client profile?  y / n"))
-	}
-	if m.message != "" {
-		lines = append(lines, "  "+warn.Render(m.message))
-	}
-	return strings.Join(lines, "\n")
+	return m.dashboardView()
 }
 
 func (m *dashboard) setupView() string {

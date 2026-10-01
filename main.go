@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"text/tabwriter"
+	"time"
 )
 
 const usage = `wgx — WireGuard Exchange
@@ -17,6 +19,8 @@ Usage:
   wgx [--config PATH] settings --endpoint HOST:PORT [--dns IP] [--allowed-ips CIDRS]
   wgx [--config PATH] peer list
   wgx [--config PATH] peer add NAME
+  wgx [--config PATH] peer rename OLD NEW
+  wgx [--config PATH] peer note NAME TEXT
   wgx [--config PATH] peer remove NAME
   wgx [--config PATH] peer export NAME [--output PATH]
   wgx [--config PATH] peer qr NAME [--output PNG|-]
@@ -110,11 +114,16 @@ func run(args []string) error {
 		if err := a.saveSettings(s); err != nil {
 			return err
 		}
+		a.recordEvent("server", "Updated client settings")
 		fmt.Println("Settings updated; existing client profiles are unchanged.")
 	case "peer":
 		return peerCommand(a, args[1:])
 	case "status":
-		fmt.Println(a.status())
+		out, err := a.status()
+		if err != nil {
+			return err
+		}
+		fmt.Println(out)
 	case "up":
 		return a.up()
 	case "down":
@@ -129,7 +138,7 @@ func run(args []string) error {
 
 func peerCommand(a Admin, args []string) error {
 	if len(args) == 0 {
-		return errors.New("peer command required: list, add, remove, export, qr")
+		return errors.New("peer command required: list, add, rename, note, remove, export, qr")
 	}
 	switch args[0] {
 	case "list":
@@ -140,14 +149,17 @@ func peerCommand(a Admin, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println("NAME\tADDRESS\tPUBLIC KEY\tTYPE")
+		_, clients := a.collectTelemetry()
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "NAME\tADDRESS\tLAST SEEN\tTYPE")
 		for _, p := range peers {
 			kind := "existing"
 			if p.Managed {
 				kind = "wgx"
 			}
-			fmt.Printf("%s\t%s\t%s\t%s\n", p.Name, p.AllowedIPs, p.PublicKey, kind)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", p.Name, p.AllowedIPs, lastSeenLabel(clients[p.PublicKey].LastSeen, time.Now()), kind)
 		}
+		return w.Flush()
 	case "add":
 		if len(args) != 2 {
 			return errors.New("usage: wgx peer add NAME")
@@ -157,6 +169,22 @@ func peerCommand(a Admin, args []string) error {
 			return err
 		}
 		fmt.Printf("Added %s; client profile: %s\n", args[1], path)
+	case "rename":
+		if len(args) != 3 {
+			return errors.New("usage: wgx peer rename OLD NEW")
+		}
+		if err := a.renamePeer(args[1], args[2]); err != nil {
+			return err
+		}
+		fmt.Printf("Renamed %s to %s\n", args[1], args[2])
+	case "note":
+		if len(args) != 3 {
+			return errors.New("usage: wgx peer note NAME TEXT")
+		}
+		if err := a.setPeerNote(args[1], args[2]); err != nil {
+			return err
+		}
+		fmt.Printf("Updated note for %s\n", args[1])
 	case "remove", "rm":
 		if len(args) != 2 {
 			return errors.New("usage: wgx peer remove NAME")
