@@ -1,0 +1,14 @@
+services:
+  wgx:
+    build: .
+    image: wgx:dev
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "51820:51820/udp"
+    volumes:
+      - wgx-data:/etc/wireguard
+    stdin_open: true
+    tty: true
+volumes:
+  wgx-data:
